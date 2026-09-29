@@ -1,0 +1,24 @@
+name: Build AMD GPU ADL Plugin
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC (32-bit)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile DLL
+        shell: cmd
+        run: cl /LD /O2 /Fe:AMDGPUStats.dll AMDGPUStats.cpp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMDGPUStats.dll
+          path: AMDGPUStats.dll
