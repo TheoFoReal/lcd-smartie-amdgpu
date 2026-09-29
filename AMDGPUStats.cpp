@@ -14,11 +14,8 @@
 #define ADL_ERR_NOT_SUPPORTED -8
 
 typedef void* (__stdcall *ADL_MAIN_MALLOC_CALLBACK)(int);
-
-// ADL context handle (for Overdrive6 / Wattman APIs)
 typedef void* ADL_CONTEXT_HANDLE;
 
-// ADL adapter info structure (partial).
 typedef struct {
     int iAdapterIndex;
     char strAdapterName[256];
@@ -34,7 +31,7 @@ typedef struct {
     int iSize;
     int iEngineClock;      // in 10 kHz units
     int iMemoryClock;      // in 10 kHz units
-    int iVddc;             // in mV
+    int iVddc;             // in mV (core voltage)
     int iActivityPercent;  // 0-100
 } ADLPMActivity;
 
@@ -64,6 +61,9 @@ typedef int (*ADL2_MAIN_CONTROL_CREATE)(ADL_MAIN_MALLOC_CALLBACK, int, ADL_CONTE
 typedef int (*ADL2_OVERDRIVE6_CURRENTPOWER_GET)(ADL_CONTEXT_HANDLE, int, int, int*);
 typedef int (*ADL2_OVERDRIVE6_CAPABILITIES_GET)(ADL_CONTEXT_HANDLE, int, void*);
 
+// VRAM usage function pointer typedef
+typedef int (*ADL2_ADAPTER_DEDICATEDVRAMUSAGE_GET)(ADL_CONTEXT_HANDLE, int, int*);
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -87,6 +87,9 @@ static ADL2_MAIN_CONTROL_CREATE             ADL2_Main_Control_Create = NULL;
 static ADL2_OVERDRIVE6_CURRENTPOWER_GET     ADL2_Overdrive6_CurrentPower_Get = NULL;
 static ADL2_OVERDRIVE6_CAPABILITIES_GET     ADL2_Overdrive6_Capabilities_Get = NULL;
 
+// VRAM usage function pointer
+static ADL2_ADAPTER_DEDICATEDVRAMUSAGE_GET  ADL2_Adapter_DedicatedVRAMUsage_Get = NULL;
+
 static ADL_CONTEXT_HANDLE g_adlContext = NULL;
 static bool g_overdrive6Supported = false;
 
@@ -97,22 +100,26 @@ static bool g_overdrive6Supported = false;
 static volatile bool gWorkerRunning = false;
 static volatile bool gHaveNewData = false;
 
-static char gCachedTemp[32] = "N/A";
-static char gCachedLoad[32] = "N/A";
-static char gCachedFan[32] = "N/A";
+static char gCachedTemp[32]      = "N/A";
+static char gCachedLoad[32]      = "N/A";
+static char gCachedFan[32]       = "N/A";
+static char gCachedPower[32]     = "N/A";
 static char gCachedCoreClock[32] = "N/A";
-static char gCachedMemClock[32] = "N/A";
-static char gCachedGpuCount[32] = "N/A";
-static char gCachedPower[32] = "N/A";
+static char gCachedMemClock[32]  = "N/A";
+static char gCachedVRAM[32]      = "N/A";
+static char gCachedVoltage[32]   = "N/A";
+static char gCachedGpuCount[32]  = "N/A";
 
-// Per-function result buffers.
-static char resultBuffer1[128];
-static char resultBuffer2[128];
-static char resultBuffer3[128];
-static char resultBuffer4[128];
-static char resultBuffer5[128];
-static char resultBuffer6[128];
-static char resultBuffer7[128];
+// Named result buffers (one per function).
+static char resultBufferTemp[128];
+static char resultBufferLoad[128];
+static char resultBufferFan[128];
+static char resultBufferPower[128];
+static char resultBufferCoreClock[128];
+static char resultBufferMemClock[128];
+static char resultBufferVRAM[128];
+static char resultBufferVoltage[128];
+static char resultBufferGpuCount[128];
 
 // ---------------------------------------------------------------------------
 // Helper: allocate memory for ADL
@@ -165,6 +172,10 @@ static unsigned int __stdcall WorkerThread(void* param) {
     ADL2_Overdrive6_Capabilities_Get =
         (ADL2_OVERDRIVE6_CAPABILITIES_GET)GetProcAddress(hADL, "ADL2_Overdrive6_Capabilities_Get");
 
+    // --- Resolve VRAM usage function pointer ---
+    ADL2_Adapter_DedicatedVRAMUsage_Get =
+        (ADL2_ADAPTER_DEDICATEDVRAMUSAGE_GET)GetProcAddress(hADL, "ADL2_Adapter_DedicatedVRAMUsage_Get");
+
     if (ADL_Main_Control_Create == NULL) {
         gInitComplete = true;
         gInitSuccess = false;
@@ -183,11 +194,7 @@ static unsigned int __stdcall WorkerThread(void* param) {
     // --- Create Overdrive6 context (separate from OD5) ---
     if (ADL2_Main_Control_Create != NULL) {
         if (ADL2_Main_Control_Create(ADL_Main_Memory_Alloc, 1, &g_adlContext) == ADL_OK) {
-            // Check if the adapter supports Overdrive6
             if (ADL2_Overdrive6_Capabilities_Get != NULL) {
-                // Simple capability check: call the function. If it returns
-                // ADL_OK, the adapter supports Overdrive6.
-                // We pass a small buffer since we only need the return code.
                 char capsBuffer[256];
                 memset(capsBuffer, 0, sizeof(capsBuffer));
                 if (ADL2_Overdrive6_Capabilities_Get(g_adlContext, 0, capsBuffer) == ADL_OK) {
@@ -226,7 +233,6 @@ static unsigned int __stdcall WorkerThread(void* param) {
     gAdapterIndex = adapterInfo[0].iAdapterIndex;
     free(adapterInfo);
 
-    // Cache the GPU count once.
     sprintf(gCachedGpuCount, "%d", numAdapters);
 
     gInitSuccess = true;
@@ -234,7 +240,7 @@ static unsigned int __stdcall WorkerThread(void* param) {
 
     // --- Poll loop: query stats every 1000ms ---
     while (gWorkerRunning) {
-        // --- Temperature (Overdrive5) ---
+        // --- Temperature ---
         ADLTemperature temp;
         temp.iSize = sizeof(ADLTemperature);
         temp.iTemperature = 0;
@@ -245,7 +251,7 @@ static unsigned int __stdcall WorkerThread(void* param) {
             strcpy(gCachedTemp, "N/A");
         }
 
-        // --- Load, Core Clock, Memory Clock (Overdrive5) ---
+        // --- Load, Core Clock, Memory Clock, Voltage ---
         ADLPMActivity activity;
         activity.iSize = sizeof(ADLPMActivity);
         memset(&activity, 0, sizeof(activity));
@@ -254,13 +260,19 @@ static unsigned int __stdcall WorkerThread(void* param) {
             sprintf(gCachedLoad, "%d", activity.iActivityPercent);
             sprintf(gCachedCoreClock, "%d", activity.iEngineClock / 100);
             sprintf(gCachedMemClock, "%d", activity.iMemoryClock / 100);
+            if (activity.iVddc > 0) {
+                sprintf(gCachedVoltage, "%.3f", activity.iVddc / 1000.0);
+            } else {
+                strcpy(gCachedVoltage, "N/A");
+            }
         } else {
             strcpy(gCachedLoad, "N/A");
             strcpy(gCachedCoreClock, "N/A");
             strcpy(gCachedMemClock, "N/A");
+            strcpy(gCachedVoltage, "N/A");
         }
 
-        // --- Fan Speed (Overdrive5) ---
+        // --- Fan Speed ---
         ADLFanSpeedValue fan;
         fan.iSize = sizeof(ADLFanSpeedValue);
         fan.iSpeedType = ADL_DL_FANCTRL_SPEED_TYPE_RPM;
@@ -273,9 +285,7 @@ static unsigned int __stdcall WorkerThread(void* param) {
             strcpy(gCachedFan, "N/A");
         }
 
-        // --- Power Consumption (Overdrive6 / Wattman) ---
-        // iPowerType = 1 means "GPU power" (as opposed to "ASIC power" or
-        // "PPT"). The value is returned in watts.
+        // --- Power Consumption ---
         if (g_overdrive6Supported && ADL2_Overdrive6_CurrentPower_Get != NULL &&
             g_adlContext != NULL) {
             int power = 0;
@@ -288,9 +298,19 @@ static unsigned int __stdcall WorkerThread(void* param) {
             strcpy(gCachedPower, "N/A");
         }
 
-        gHaveNewData = true;
+        // --- Dedicated VRAM Usage ---
+        if (ADL2_Adapter_DedicatedVRAMUsage_Get != NULL && g_adlContext != NULL) {
+            int vramUsageMB = 0;
+            if (ADL2_Adapter_DedicatedVRAMUsage_Get(g_adlContext, gAdapterIndex, &vramUsageMB) == ADL_OK) {
+                sprintf(gCachedVRAM, "%d", vramUsageMB);
+            } else {
+                strcpy(gCachedVRAM, "N/A");
+            }
+        } else {
+            strcpy(gCachedVRAM, "N/A");
+        }
 
-        // Sleep for 1000ms (1 second) before the next poll.
+        gHaveNewData = true;
         Sleep(1000);
     }
 
@@ -309,102 +329,138 @@ static void EnsureWorkerStarted() {
 }
 
 // ---------------------------------------------------------------------------
-// Function 1: GPU Temperature
+// Function 1: GPU Temperature (°C, one decimal)
+// Usage: $dll(AMDGPUStats.dll,1,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function1(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer1, "N/A");
+        strcpy(resultBufferTemp, "N/A");
     } else {
-        strcpy(resultBuffer1, gCachedTemp);
+        strcpy(resultBufferTemp, gCachedTemp);
     }
-    return resultBuffer1;
+    return resultBufferTemp;
 }
 
 // ---------------------------------------------------------------------------
-// Function 2: GPU Load
+// Function 2: GPU Load (%, 0-100)
+// Usage: $dll(AMDGPUStats.dll,2,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function2(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer2, "N/A");
+        strcpy(resultBufferLoad, "N/A");
     } else {
-        strcpy(resultBuffer2, gCachedLoad);
+        strcpy(resultBufferLoad, gCachedLoad);
     }
-    return resultBuffer2;
+    return resultBufferLoad;
 }
 
 // ---------------------------------------------------------------------------
-// Function 3: Fan Speed
+// Function 3: Fan Speed (RPM)
+// Usage: $dll(AMDGPUStats.dll,3,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function3(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer3, "N/A");
+        strcpy(resultBufferFan, "N/A");
     } else {
-        strcpy(resultBuffer3, gCachedFan);
+        strcpy(resultBufferFan, gCachedFan);
     }
-    return resultBuffer3;
+    return resultBufferFan;
 }
 
 // ---------------------------------------------------------------------------
-// Function 4: Core Clock
+// Function 4: GPU Power Consumption (watts)
+// Usage: $dll(AMDGPUStats.dll,4,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function4(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer4, "N/A");
+        strcpy(resultBufferPower, "N/A");
     } else {
-        strcpy(resultBuffer4, gCachedCoreClock);
+        strcpy(resultBufferPower, gCachedPower);
     }
-    return resultBuffer4;
+    return resultBufferPower;
 }
 
 // ---------------------------------------------------------------------------
-// Function 5: Memory Clock
+// Function 5: Core Clock (MHz)
+// Usage: $dll(AMDGPUStats.dll,5,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function5(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer5, "N/A");
+        strcpy(resultBufferCoreClock, "N/A");
     } else {
-        strcpy(resultBuffer5, gCachedMemClock);
+        strcpy(resultBufferCoreClock, gCachedCoreClock);
     }
-    return resultBuffer5;
+    return resultBufferCoreClock;
 }
 
 // ---------------------------------------------------------------------------
-// Function 6: Number of AMD GPUs
+// Function 6: Memory Clock (MHz)
+// Usage: $dll(AMDGPUStats.dll,6,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function6(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer6, "0");
+        strcpy(resultBufferMemClock, "N/A");
     } else {
-        strcpy(resultBuffer6, gCachedGpuCount);
+        strcpy(resultBufferMemClock, gCachedMemClock);
     }
-    return resultBuffer6;
+    return resultBufferMemClock;
 }
 
 // ---------------------------------------------------------------------------
-// Function 7: GPU Power Consumption (watts)
+// Function 7: Dedicated VRAM Usage (MB)
 // Usage: $dll(AMDGPUStats.dll,7,,)
 // ---------------------------------------------------------------------------
 
 DLL_EXPORT char* __stdcall function7(char* param1, char* param2) {
     EnsureWorkerStarted();
     if (gInitComplete && !gInitSuccess) {
-        strcpy(resultBuffer7, "N/A");
+        strcpy(resultBufferVRAM, "N/A");
     } else {
-        strcpy(resultBuffer7, gCachedPower);
+        strcpy(resultBufferVRAM, gCachedVRAM);
     }
-    return resultBuffer7;
+    return resultBufferVRAM;
+}
+
+// ---------------------------------------------------------------------------
+// Function 8: GPU Core Voltage (volts)
+// Usage: $dll(AMDGPUStats.dll,8,,)
+// ---------------------------------------------------------------------------
+
+DLL_EXPORT char* __stdcall function8(char* param1, char* param2) {
+    EnsureWorkerStarted();
+    if (gInitComplete && !gInitSuccess) {
+        strcpy(resultBufferVoltage, "N/A");
+    } else {
+        strcpy(resultBufferVoltage, gCachedVoltage);
+    }
+    return resultBufferVoltage;
+}
+
+// ---------------------------------------------------------------------------
+// Function 9: Number of AMD GPUs
+// Usage: $dll(AMDGPUStats.dll,9,,)
+// ---------------------------------------------------------------------------
+
+DLL_EXPORT char* __stdcall function9(char* param1, char* param2) {
+    EnsureWorkerStarted();
+    if (gInitComplete && !gInitSuccess) {
+        strcpy(resultBufferGpuCount, "0");
+    } else {
+        strcpy(resultBufferGpuCount, gCachedGpuCount);
+    }
+    return resultBufferGpuCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,14 +481,12 @@ DLL_EXPORT void __stdcall SmartieInit() {
 
 DLL_EXPORT void __stdcall SmartieFini() {
     gWorkerRunning = false;
-    Sleep(100); // give the worker thread a moment to exit
+    Sleep(100);
 
     if (gInitSuccess && ADL_Main_Control_Destroy != NULL) {
         ADL_Main_Control_Destroy();
     }
     if (g_adlContext != NULL) {
-        // ADL2 context cleanup is handled by the ADL runtime when the
-        // library is unloaded. We just clear the handle.
         g_adlContext = NULL;
     }
     if (hADL != NULL) {
