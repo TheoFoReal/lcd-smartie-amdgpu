@@ -241,12 +241,14 @@ static unsigned int __stdcall WorkerThread(void* param) {
     // --- Poll loop: query stats every 1000ms ---
     while (gWorkerRunning) {
         // --- Temperature ---
+        // NOTE: Formatted as a whole number ("%.0f"), which rounds to the
+        // nearest degree. Use "%.1f" if you ever want one decimal place back.
         ADLTemperature temp;
         temp.iSize = sizeof(ADLTemperature);
         temp.iTemperature = 0;
         if (ADL_Overdrive5_Temperature_Get != NULL &&
             ADL_Overdrive5_Temperature_Get(gAdapterIndex, 0, &temp) == ADL_OK) {
-            sprintf(gCachedTemp, "%.1f", temp.iTemperature / 1000.0);
+            sprintf(gCachedTemp, "%.0f", temp.iTemperature / 1000.0);
         } else {
             strcpy(gCachedTemp, "N/A");
         }
@@ -329,7 +331,7 @@ static void EnsureWorkerStarted() {
 }
 
 // ---------------------------------------------------------------------------
-// Function 1: GPU Temperature (°C, one decimal)
+// Function 1: GPU Temperature (°C, whole number)
 // Usage: $dll(AMDGPUStats.dll,1,,)
 // ---------------------------------------------------------------------------
 
