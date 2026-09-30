@@ -8,6 +8,7 @@ $dll(AMDGPUStats,[Stat],,)
 
 # Clarification:
 Stat = 1: GPU Temp (C)
+
 Stat = 2: GPU Load (%)
 Stat = 3: Fan Speed (RPM)
 Stat = 4: GPU Power Consumption (W)
