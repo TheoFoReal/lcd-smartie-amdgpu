@@ -1,7 +1,7 @@
 # **lcd-smartie-amdgpu**
 
 # Description:
-Outputs GPU performance stats.
+Outputs GPU performance stats (using ADL).
 
 # Formatting:
 $dll(AMDGPUStats,[Stat],,)
