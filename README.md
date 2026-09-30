@@ -7,7 +7,7 @@ Outputs AMD GPU performance stats (using ADL).
 $dll(AMDGPUStats,[stat],,)
 
 # Clarification:
-[stat] = 1 ⟶ GPU Temp (C)  
+[stat] = 1 ⟶ GPU Temp (°C)  
 [stat] = 2 ⟶ GPU Load (%)  
 [stat] = 3 ⟶ Fan Speed (RPM)  
 [stat] = 4 ⟶ GPU Power Consumption (W)  
